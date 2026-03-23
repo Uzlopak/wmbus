@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>wmbusmeters</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+    --bg:#0a0a0a; --surface:#141414; --border:#252525;
+    --text:#b0b8c0; --dim:#555e68; --bright:#e0e4e8;
+    --green:#3fb950; --cyan:#58a6ff; --amber:#d29922; --red:#f85149;
+    --mono:'IBM Plex Mono','Menlo',monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--mono);background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+
+.topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 16px;height:40px;display:flex;align-items:center;gap:12px;font-size:12px;flex-shrink:0}
+.topbar .logo{color:var(--green);font-weight:600;font-size:13px}
+.topbar .ver{color:var(--dim);font-weight:400;font-size:11px;margin-left:6px}
+.topbar .sep{width:1px;height:20px;background:var(--border)}
+.topbar .dot{width:7px;height:7px;border-radius:50%;background:var(--dim)}
+.topbar .dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.topbar .lbl{color:var(--dim)}
+.topbar select,.topbar button{font-family:var(--mono);font-size:11px;padding:3px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;cursor:pointer}
+.topbar button:hover{border-color:var(--dim)}
+.topbar button.g{border-color:var(--green);color:var(--green)}
+.topbar button.g:hover{background:#1a2f1a}
+.topbar button:disabled{opacity:.3;cursor:default}
+
+.port-tag{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;font-size:11px;color:var(--cyan)}
+.port-tag .port-dot{width:5px;height:5px;border-radius:50%;background:var(--green)}
+.port-tag .port-remove{color:var(--dim);cursor:pointer;margin-left:2px}
+.port-tag .port-remove:hover{color:var(--red)}
+
+.terminal{flex:1;overflow-y:auto;padding:12px 16px;font-size:12.5px;line-height:1.65;background:var(--bg)}
+.line{padding:1px 0;white-space:pre-wrap;word-break:break-all}
+.line.dim{color:var(--dim)} .line.green{color:var(--green)} .line.cyan{color:var(--cyan)}
+.line.amber{color:var(--amber)} .line.red{color:var(--red)} .line.bright{color:var(--bright)}
+
+.prompt-wrap{display:flex;align-items:center;gap:0;background:var(--surface);border-top:1px solid var(--border);padding:0 16px;height:32px;flex-shrink:0}
+.prompt-wrap .ps{color:var(--green);font-size:12px;white-space:nowrap}
+.prompt-wrap input{flex:1;background:transparent;border:none;outline:none;color:var(--bright);font-family:var(--mono);font-size:12px;padding:0 6px}
+
+.statusbar{background:var(--surface);border-top:1px solid var(--border);padding:0 16px;height:24px;display:flex;align-items:center;gap:16px;font-size:10px;color:var(--dim);flex-shrink:0}
+::-webkit-scrollbar{width:6px} ::-webkit-scrollbar-track{background:transparent} ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+    <span class="logo">wmbusmeters<span class="ver" id="ver"></span></span>
+    <div class="sep"></div>
+    <div class="dot" id="wasmDot"></div>
+    <span class="lbl" id="wasmLbl">loading…</span>
+    <div class="sep"></div>
+    <button class="g" id="btnAddPort" onclick="addPort()">+ Add Port</button>
+    <div id="portTags"></div>
+</div>
+
+<div class="terminal" id="term"></div>
+
+<div class="prompt-wrap">
+    <span class="ps">wmbusmeters$&nbsp;</span>
+    <input type="text" id="input" placeholder="e.g. auto:t1  or  --listmeters  or  --help" autofocus />
+</div>
+
+<div class="statusbar">
+    <span id="sbStatus">ready</span>
+    <span id="sbPorts">no ports</span>
+</div>
+
+<script src="serial-manager.js"></script>
+
+<script>
+// ═══════════════════════════════════════════════════════
+// wmbusmeters Web Terminal
+//
+// "Add Port" registers a WebSerial port.
+// Then you type commands exactly like the CLI:
+//   auto:t1
+//   webserial:0:t1 MyMeter multical21 12345678 KEY
+//   --listmeters
+//   --analyze=...
+// wmbusmeters main() uses the registered port(s).
+// ═══════════════════════════════════════════════════════
+
+let wasmModule = null, wasmReady = false, wm = {};
+let mainRunning = false;
+
+// ── 1. Serial manager (before WASM) ──────────────────
+const serialMgr = new SerialCommunicationManagerImp();
+serialMgr.registerGlobals();
+
+// ── Terminal ──────────────────────────────────────────
+const term = document.getElementById('term');
+function print(text, cls) {
+    const el = document.createElement('div');
+    el.className = 'line' + (cls ? ' ' + cls : '');
+    el.textContent = text;
+    term.appendChild(el);
+    if (term.scrollHeight - term.scrollTop - term.clientHeight < 200)
+        term.scrollTop = term.scrollHeight;
+}
+
+// ── 2. WASM Init ─────────────────────────────────────
+async function initWasm() {
+    try {
+        const s = document.createElement('script');
+        s.src = 'dist/wmbusmeters.js';
+        document.head.appendChild(s);
+        await new Promise((ok, no) => { s.onload = ok; s.onerror = () => no(new Error('dist/wmbusmeters.js not found')); });
+
+        wasmModule = await WMBusMeters({
+            print:    (text) => print(text),
+            printErr: (text) => print(text, 'amber'),
+        });
+
+        serialMgr.setWasmModule(wasmModule);
+
+        wm.free    = wasmModule.cwrap('wm_free_result', null, []);
+        wm.version = wasmModule.cwrap('wm_version', 'string', []);
+        wm.main    = wasmModule.cwrap('wm_main', 'string', ['string'], { async: true });
+        wm.stop    = wasmModule.cwrap('wm_stop', null, []);
+
+        wasmReady = true;
+        const v = wm.version();
+        document.getElementById('ver').textContent = ' ' + v;
+        document.getElementById('wasmDot').classList.add('on');
+        document.getElementById('wasmLbl').textContent = 'ready';
+
+        print(v, 'green');
+        print('', 'dim');
+        print('Usage:', 'dim');
+        print('  1. Click "+ Add Port" to register your wMBus dongle', 'dim');
+        print('  2. Type a command below — same syntax as the CLI:', 'dim');
+        print('', 'dim');
+        print('     auto:t1                              listen on auto-detected device', 'cyan');
+        print('     auto:t1 MyMeter multical21 12345678  listen + decode specific meter', 'cyan');
+        print('     --listmeters                         list available drivers', 'cyan');
+        print('     --listfields=multical21               list fields for a driver', 'cyan');
+        print('     --analyze=...                        analyze a hex telegram', 'cyan');
+        print('     --help                               full help', 'cyan');
+        print('', 'dim');
+        print('  Type "stop" to stop a running session.', 'dim');
+        print('  Type "clear" to clear the terminal.', 'dim');
+        print('', 'dim');
+
+    } catch (e) {
+        document.getElementById('wasmLbl').textContent = 'error';
+        print('WASM load failed: ' + e.message, 'red');
+    }
+}
+
+// ── Add Port ──────────────────────────────────────────
+// Opens the browser serial port dialog.
+// The port is registered so wmbusmeters can find it
+// via listSerialTTYs() → "webserial:0" etc.
+async function addPort() {
+    if (!wasmReady) { print('WASM not ready yet.', 'red'); return; }
+
+    try {
+        const baud = 9600; // Default — wmbusmeters will re-open at the right baud during detection
+        const dev = await serialMgr.requestAndOpen(baud);
+        if (!dev) { print('Failed to open port.', 'red'); return; }
+
+        const info = dev.getInfo();
+        const vid = info.usbVendorId ? `VID=0x${info.usbVendorId.toString(16).padStart(4,'0')}` : '';
+        const pid = info.usbProductId ? `PID=0x${info.usbProductId.toString(16).padStart(4,'0')}` : '';
+        const usb = [vid, pid].filter(Boolean).join(' ');
+
+        print(`Port added: /dev/ttyUSB${dev.index}${usb ? ' (' + usb + ')' : ''}`, 'green');
+        print(`Use it as: auto:t1  or  /dev/ttyUSB${dev.index}:t1`, 'dim');
+        print('', 'dim');
+
+        renderPortTags();
+
+    } catch (e) {
+        if (e.name === 'NotFoundError') {
+            // User cancelled the dialog
+        } else {
+            print('Port error: ' + e.message, 'red');
+        }
+    }
+}
+
+// ── Remove Port ───────────────────────────────────────
+async function removePort(index) {
+    if (mainRunning) {
+        print('Cannot remove port while running — type "stop" first.', 'amber');
+        return;
+    }
+    await serialMgr.closeByIndex(index);
+    print(`Port /dev/ttyUSB${index} removed.`, 'dim');
+    renderPortTags();
+}
+
+// ── Port Tags UI ──────────────────────────────────────
+function renderPortTags() {
+    const container = document.getElementById('portTags');
+    container.innerHTML = '';
+
+    const count = serialMgr.getDeviceCount();
+    document.getElementById('sbPorts').textContent = count === 0 ? 'no ports' : count + ' port(s)';
+
+    // Iterate through known devices
+    for (let i = 0; i < 10; i++) {
+        const dev = serialMgr.findByIndex(i);
+        if (!dev || !dev.isOpen) continue;
+
+        const info = dev.getInfo();
+        const vid = info.usbVendorId ? info.usbVendorId.toString(16).padStart(4,'0') : '';
+
+        const tag = document.createElement('span');
+        tag.className = 'port-tag';
+        tag.innerHTML = `<span class="port-dot"></span>/dev/ttyUSB${dev.index}${vid ? ' <span style="color:var(--dim)">' + vid + '</span>' : ''}<span class="port-remove" onclick="removePort(${dev.index})">×</span>`;
+        container.appendChild(tag);
+    }
+}
+
+// ── Command Input ─────────────────────────────────────
+document.getElementById('input').addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    const cmd = e.target.value.trim();
+    e.target.value = '';
+    if (!cmd) return;
+
+    if (cmd === 'clear') { term.innerHTML = ''; return; }
+    if (cmd === 'stop') {
+        if (mainRunning) { wm.stop(); print('Stopping...', 'amber'); }
+        else print('Nothing running.', 'dim');
+        return;
+    }
+
+    execCommand(cmd);
+});
+
+async function execCommand(cmd) {
+    print('$ wmbusmeters ' + cmd, 'bright');
+
+    if (!wasmReady) { print('WASM not loaded yet.', 'red'); return; }
+    if (mainRunning) { print('Already running — type "stop" first.', 'amber'); return; }
+
+    mainRunning = true;
+    document.getElementById('sbStatus').textContent = 'running...';
+
+    try {
+        const raw = await wm.main(cmd);
+        wm.free();
+
+        try {
+            const res = JSON.parse(raw);
+            if (res.exit_code !== 0) {
+                print(`(exit code: ${res.exit_code})`, 'amber');
+            }
+        } catch (e) {}
+
+    } catch (e) {
+        print('WASM error: ' + e.message, 'red');
+    }
+
+    mainRunning = false;
+    document.getElementById('sbStatus').textContent = 'ready';
+    document.getElementById('btnAddPort').disabled = false;
+}
+
+// ── Init ──────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+    if (!('serial' in navigator)) {
+        print('Web Serial API not supported — use Chrome or Edge.', 'red');
+        document.getElementById('btnAddPort').disabled = true;
+    }
+    initWasm();
+});
+</script>
+</body>
+</html>
