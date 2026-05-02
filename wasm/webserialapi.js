@@ -865,6 +865,7 @@ if (
   navigator.usb !== undefined &&
   navigator.serial === undefined
 ) {
+  console.log('navigator.serial is not defined, applying Web Serial API polyfill');
   /* an object to be used for starting the serial workflow */
   navigator.serial = new Serial();
 }
