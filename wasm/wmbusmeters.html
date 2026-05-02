@@ -125,7 +125,9 @@ body{font-family:var(--mono);background:var(--bg);color:var(--text);height:100vh
 <body>
 
 <div class="topbar">
-    <span class="logo">wmbusmeters<span class="ver" id="ver"></span></span>
+    <span class="logo">wmbusmeters
+        <!-- <span class="ver" id="ver"></span> -->
+    </span>
     <div class="sep"></div>
     <div class="dot" id="wasmDot"></div>
     <span class="lbl" id="wasmLbl">loading…</span>
@@ -481,7 +483,7 @@ async function initWasm() {
         renderSetupSelect(); updateMenuCounts();
 
         const v = wm.version();
-        document.getElementById('ver').textContent = ' ' + v;
+        // document.getElementById('ver').textContent = ' ' + v;
         document.getElementById('wasmDot').classList.add('on');
         document.getElementById('wasmLbl').textContent = 'ready';
 
