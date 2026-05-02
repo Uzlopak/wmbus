@@ -1,4 +1,19 @@
-// @ts-check
+/*
+ Copyright (C) 2026 Aras Abbasi (gpl-3.0-or-later)
+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+
+ You should have received a copy of the GNU General Public License
+ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
 
 /**
  * @template T
@@ -8,12 +23,42 @@
  * @property {NonNullable<Parameters<Promise<T>['then']>[1]>} reject
  */
 
-/** @template T @returns {DeferredPromise<*>} */
+/**
+ * @template T
+ * @returns {DeferredPromise<T>}
+ */
 function createDeferredPromise() {
-  /** @type {any} */ let res;
-  /** @type {any} */ let rej;
-    const promise = new Promise((resolve, reject) => { res = resolve; rej = reject; });
-    return { promise, resolve: res, reject: rej };
+    /** @type {(value: T | PromiseLike<T>) => void} */
+    let resolve;
+    /** @type {(reason?: any) => void} */
+    let reject;
+
+    const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+
+    if (!resolve || !reject) {
+        throw new Error("DeferredPromise initialization failed");
+    }
+
+    let settled = false;
+
+    return {
+        promise,
+        resolve: (v) => {
+            if (!settled) {
+                settled = true;
+                resolve(v);
+            }
+        },
+        reject: (e) => {
+            if (!settled) {
+                settled = true;
+                reject(e);
+            }
+        }
+    };
 }
 
 const parityMap = /** @type {const} */ ({ 0: 'none', 1: 'even', 2: 'odd' });
@@ -132,23 +177,33 @@ class SerialDeviceImp {
         this.reading = false;
         this.pendingData = [];
 
-        // Stop reader
+        const reader = this.#reader;
+        this.#reader = null;
+
         try {
-            if (this.#reader) {
-                await this.#reader.cancel();
+            if (reader) {
+                await reader.cancel();
+                reader.releaseLock();
             }
         } catch (e) {
-            console.error(`[serial:${this.#index}] reader cancel failed:`, e);
+            console.error(`[serial:${this.#index}] reader shutdown failed:`, e);
         }
 
-        // Wait for all pending writes (prevents "closing stream" error)
+        try {
+            await Promise.race([
+                this.#readLoop,
+                new Promise(resolve => setTimeout(resolve, 2000)) // safety timeout
+            ]);
+        } catch {}
+
+        this.#readLoop = null;
+
         try {
             await this.#writeLock;
         } catch (e) {
-            console.error(`[serial:${this.#index}] write lock failed during close:`, e);
+            console.error(`[serial:${this.#index}] write lock failed:`, e);
         }
 
-        // Atomically invalidate writer so no new writes can start
         const writer = this.#writer;
         this.#writer = null;
 
@@ -161,18 +216,12 @@ class SerialDeviceImp {
             console.error(`[serial:${this.#index}] writer close failed:`, e);
         }
 
-        // Ensure read loop is fully stopped
-        await this.#readLoop;
-        this.#readLoop = null;
-
         try {
-            await this.#port.close()
-            console.log(`[serial:${this.#index}] port closed.`)
+            await this.#port.close();
         } catch (e) {
             console.error(`[serial:${this.#index}] port close failed:`, e);
         }
 
-        this.#reader = null;
         this.#closing = false;
     }
 
@@ -184,8 +233,7 @@ class SerialDeviceImp {
     async send(data) {
         if (this.#closing || !this.#writer) return false;
 
-        // Chain writes → guarantees FIFO + no race with close()
-        this.#writeLock = this.#writeLock.then(async () => {
+        const writeOp = async () => {
             if (this.#closing || !this.#writer) return false;
 
             try {
@@ -195,7 +243,11 @@ class SerialDeviceImp {
                 console.error(`[serial:${this.#index}] write error:`, e);
                 return false;
             }
-        });
+        };
+
+        this.#writeLock = this.#writeLock
+            .catch(() => {}) // prevent chain poisoning
+            .then(writeOp);
 
         return this.#writeLock;
     }
@@ -208,30 +260,34 @@ class SerialDeviceImp {
     async #startReadLoop() {
         if (!this.#port.readable) return;
 
-        this.#reader = this.#port.readable.getReader();
+        const reader = this.#port.readable.getReader();
+        this.#reader = reader;
         this.reading = true;
         this.pendingData = [];
 
         try {
-            while (this.#reader) {
-                const { value, done } = await this.#reader.read();
-                if (done) break;
-                if (this.reading && (!value || value.length === 0)) continue;
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done || !this.reading) break;
 
-                this.pendingData.push(new Uint8Array(value));
-                if (!this.reading) break;
+                if (value && value.length > 0) {
+                    // copy to avoid underlying buffer reuse
+                    this.pendingData.push(new Uint8Array(value));
+
+                    // prevent unbounded growth
+                    if (this.pendingData.length > 1000) {
+                        console.warn(`[serial:${this.#index}] buffer overflow, trimming`);
+                        this.pendingData.splice(0, 500);
+                    }
+                }
             }
         } catch (e) {
             if (this.reading) {
                 console.error(`[serial:${this.#index}] read error:`, e);
-            } else {
-                console.log(`[serial:${this.#index}] read loop stopped.`);
             }
         } finally {
-            try { this.#reader && this.#reader.releaseLock(); } catch (e) {
-                console.error(`[serial:${this.#index}] reader releaseLock failed:`, e);
-            }
-            this.#reader = null;
+            try { reader.releaseLock(); } catch {}
+            if (this.#reader === reader) this.#reader = null;
         }
     }
 
@@ -452,10 +508,8 @@ class SerialCommunicationManagerImp extends EventTarget {
 
         // Register in C++ so listSerialTTYs() finds it
         if (this.wasmModule) {
-            const wmSerialOpen = this.wasmModule.cwrap('wm_serial_open', 'string', ['number']);
-            const wmFree = this.wasmModule.cwrap('wm_free_result', null, []);
-            wmSerialOpen(dev.index);
-            wmFree();
+            const wmOpen = this.wasmModule.cwrap('wm_serial_open', null, ['number']);
+            wmOpen(dev.index);
         }
 
         return dev;
@@ -469,7 +523,7 @@ class SerialCommunicationManagerImp extends EventTarget {
         await this.#initialized.promise;
         return [...this.#serialPorts.values()]
             .filter(d => d.isOpen)
-            .map(d => `/dev/ttyUSB${d.index}`)
+            .map(d => `/dev/ttyWebUSB${d.index}`)
             .sort();
     }
 
@@ -499,10 +553,8 @@ class SerialCommunicationManagerImp extends EventTarget {
 
             // Register in C++ so listSerialTTYs() finds it
             if (this.wasmModule) {
-                const wmSerialOpen = this.wasmModule.cwrap('wm_serial_open', 'string', ['number']);
-                const wmFree = this.wasmModule.cwrap('wm_free_result', null, []);
-                wmSerialOpen(dev.index);
-                wmFree();
+                const wmOpen = this.wasmModule.cwrap('wm_serial_open', null, ['number']);
+                wmOpen(dev.index);
             }
 
             opened.push(dev);
@@ -642,9 +694,12 @@ class SerialCommunicationManagerImp extends EventTarget {
             if (!data) return 0;
             if (mgr.wasmModule && mgr.onDataFn) {
                 const ptr = mgr.wasmModule._malloc(data.length);
-                mgr.wasmModule.HEAPU8.set(data, ptr);
-                mgr.onDataFn(index, ptr, data.length);
-                mgr.wasmModule._free(ptr);
+                try {
+                    mgr.wasmModule.HEAPU8.set(data, ptr);
+                    mgr.onDataFn(index, ptr, data.length);
+                } finally {
+                    mgr.wasmModule._free(ptr);
+                }
             }
             return data.length;
         };
